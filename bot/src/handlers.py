@@ -693,19 +693,28 @@ async def opencode_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             "🤖 *OpenCode — AI Coding Agent*\n\n"
             "Uso:\n"
             "`/oc <tarea>` — Enviar tarea\n"
-            "`/oc librarian <tarea>` — Usar agente librarian\n"
+            "`/oc [agente] <tarea>` — Usar agente específico\n"
             "📸 Foto + `/oc <tarea>` como caption\n"
             "↩️ Responde a una foto con `/oc <tarea>`\n\n"
+            "*Agentes disponibles:*\n"
+            "• `librarian` — Captura y procesamiento de lectura\n"
+            "• `reviewer` — Auditoría y mantenimiento del vault\n"
+            "• `connector` — Descubrir conexiones entre notas\n"
+            "• `writer` — Generar ensayos y síntesis\n"
+            "• `archivist` — Gestión de inbox y archivo\n"
+            "• `developer` — Desarrollo de código\n\n"
             "Ejemplos:\n"
-            "`/oc refactoriza la función process_photo`\n"
-            "`/oc librarian crea una nota atómica sobre productividad`",
+            "`/oc reviewer audit`\n"
+            "`/oc connector find connections`\n"
+            "`/oc writer essay about leadership`\n"
+            "`/oc archivist process inbox`",
             parse_mode="Markdown",
         )
         return
 
     # --- Parse agent and prompt ---
     agent = None
-    known_agents = ("librarian", "developer", "plan", "build", "explore", "general", "vision")
+    known_agents = ("librarian", "developer", "reviewer", "connector", "writer", "archivist", "plan", "build", "explore", "general", "vision")
     if args and args[0] in known_agents:
         agent = args.pop(0)
 
