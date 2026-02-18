@@ -1,0 +1,16 @@
+services:
+  librarian-bot:
+    build:
+      context: ./bot
+      dockerfile: Dockerfile
+    container_name: librarian-bot
+    restart: unless-stopped
+    env_file:
+      - ./bot/.env
+    volumes:
+      - ${VAULT_PATH:-../second-brain}:/vault:rw
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

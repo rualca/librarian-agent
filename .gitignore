@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+
+# Bot
+bot/.env
+bot/.venv/
+bot/__pycache__/
+bot/src/__pycache__/
+*.pyc
+
+# OpenCode
+.opencode/node_modules/
+.opencode/bun.lock
