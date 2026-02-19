@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,12 +20,15 @@ from src.models import (
     MAX_CONTEXT_CHARS,
     KEEP_LAST_TURNS,
 )
-from src import llm, vault, opencode, openlibrary
+from src import llm, vault, opencode, openlibrary, chaining, embeddings, scheduler, exam
 
 logger = logging.getLogger(__name__)
 
 # In-memory session storage (per user)
 _sessions: dict[int, SessionContext] = {}
+
+# In-memory quiz sessions (per user)
+_quiz_sessions: dict[int, exam.QuizSession] = {}
 
 
 def _get_session(user_id: int) -> SessionContext:
@@ -161,6 +165,13 @@ async def start_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/reading — Dashboard de lectura\n"
         "/orphan — Cards sin enlazar a MOCs\n"
         "/find `título` — Buscar libros en Open Library\n"
+        "/reindex — Reindexar vault para búsqueda semántica\n"
+        "/jobs — Ver/ejecutar tareas programadas\n"
+        "/quiz `título` — Quiz rápido de retención\n"
+        "/exam `título` — Examen profundo\n"
+        "/score — Dashboard de retención\n"
+        "/review — Items pendientes de revisión\n"
+        "/chain `nombre` `tarea` — Cadena de agentes\n"
         "/cancel — Resetear sesión\n"
         "/oc — OpenCode con agente\n"
         "/help — Mostrar esta ayuda"
@@ -365,11 +376,35 @@ async def search_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     
     # Perform search
-    cards_results, encounters_results = vault.search_vault(query)
-    
-    # Format response
     parts: list[str] = []
-    
+
+    if use_llm:
+        # Semantic search with FAISS embeddings
+        semantic_results = embeddings.semantic_search(query, top_k=10)
+
+        if not semantic_results:
+            # Fallback to keyword search
+            cards_results, encounters_results = vault.search_vault(query)
+            if not cards_results and not encounters_results:
+                reply = f"🔍 *Resultados para:* '{query}'\n\n❌ No se encontraron resultados."
+                await update.message.reply_text(reply, parse_mode="Markdown")
+                _record_bot_reply(session, reply)
+                return
+            parts.append(f"🔍 *Resultados para:* '{query}' _(fallback a keyword)_\n")
+        else:
+            parts.append(f"🧠 *Búsqueda semántica:* '{query}'\n")
+            for i, r in enumerate(semantic_results[:10], 1):
+                score_pct = int(r["score"] * 100)
+                snippet = r["text"][:80].replace("\n", " ")
+                parts.append(f"{i}. *{r['title']}* — {r['section']}")
+                parts.append(f"   _{snippet}..._ ({score_pct}%)")
+            reply = "\n".join(parts)
+            await update.message.reply_text(reply, parse_mode="Markdown")
+            _record_bot_reply(session, reply)
+            return
+
+    cards_results, encounters_results = vault.search_vault(query)
+
     if not cards_results and not encounters_results:
         reply = (
             f"🔍 *Resultados para:* '{query}'\n\n"
@@ -378,10 +413,9 @@ async def search_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(reply, parse_mode="Markdown")
         _record_bot_reply(session, reply)
         return
-    
+
     parts.append(f"🔍 *Resultados para:* '{query}'\n")
-    
-    # Encounters results
+
     if encounters_results:
         parts.append(f"\n📚 *ENCOUNTERS ({len(encounters_results)})*")
         parts.append("━" * 20)
@@ -390,8 +424,7 @@ async def search_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             parts.append(f"• {r['title']}{pages_info}")
         if len(encounters_results) > 10:
             parts.append(f"  ...y {len(encounters_results) - 10} más")
-    
-    # Cards results
+
     if cards_results:
         parts.append(f"\n🗂️ *CARDS ({len(cards_results)})*")
         parts.append("━" * 20)
@@ -399,9 +432,9 @@ async def search_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             parts.append(f"• {r['title']}")
         if len(cards_results) > 10:
             parts.append(f"  ...y {len(cards_results) - 10} más")
-    
-    parts.append("\n💡 Usa `/search --ai <término>` para búsqueda semántica más inteligente")
-    
+
+    parts.append("\n💡 Usa `/search --ai <término>` para búsqueda semántica")
+
     reply = "\n".join(parts)
     await update.message.reply_text(reply, parse_mode="Markdown")
     _record_bot_reply(session, reply)
@@ -619,6 +652,129 @@ async def find_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def reindex_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /reindex command — rebuild the semantic search index."""
+    if not await _check_auth(update):
+        return
+
+    force = ctx.args and ctx.args[0] == "--force"
+    await update.message.reply_text("🔄 Actualizando índice semántico...")
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    try:
+        added, updated, removed = embeddings.ensure_index(force=force)
+        stats = embeddings.index_stats()
+        reply = (
+            f"✅ *Índice actualizado*\n\n"
+            f"📥 Añadidos: {added}\n"
+            f"🔄 Actualizados: {updated}\n"
+            f"🗑️ Eliminados: {removed}\n"
+            f"📊 Total: {stats['total_chunks']} chunks de {stats['total_files']} archivos"
+        )
+    except Exception as e:
+        logger.error("Reindex failed: %s", e)
+        reply = f"❌ Error al indexar: `{e}`"
+
+    await update.message.reply_text(reply, parse_mode="Markdown")
+
+
+async def jobs_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /jobs command — list and trigger scheduled jobs."""
+    if not await _check_auth(update):
+        return
+
+    args = list(ctx.args) if ctx.args else []
+
+    # /jobs run <name> — trigger a job immediately
+    if len(args) >= 2 and args[0] == "run":
+        job_name = args[1]
+        await update.message.reply_text(f"⏳ Ejecutando tarea *{job_name}*...", parse_mode="Markdown")
+        await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        try:
+            result = await scheduler.run_job_now(job_name, ctx.bot)
+            if len(result) > 3900:
+                result = result[:3900] + "\n\n…(truncado)"
+            await update.message.reply_text(f"✅ *Resultado:*\n\n{result}", parse_mode="Markdown")
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: `{e}`", parse_mode="Markdown")
+        return
+
+    # /jobs — list all
+    jobs = scheduler.list_jobs()
+    parts = ["📋 *Tareas programadas*\n"]
+    for j in jobs:
+        status = "✅" if j["enabled"] else "❌"
+        parts.append(
+            f"{status} *{j['name']}*\n"
+            f"   🤖 {j['agent']} — {j['schedule_description']}\n"
+            f"   {j['description']}"
+        )
+    parts.append("\n💡 `/jobs run <nombre>` para ejecutar ahora")
+    await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+
+
+async def chain_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /chain command — run a predefined agent chain."""
+    if not await _check_auth(update):
+        return
+
+    args = list(ctx.args) if ctx.args else []
+
+    if not args:
+        chains = chaining.list_chains()
+        parts = ["🔗 *Cadenas de agentes disponibles*\n"]
+        for c in chains:
+            parts.append(f"• `{c['name']}` — {c['description']}")
+        parts.append("\nUso: `/chain <nombre> <tarea>`")
+        await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+        return
+
+    chain_name = args[0]
+    chain_steps = chaining.get_chain(chain_name)
+
+    if chain_steps is None:
+        await update.message.reply_text(f"❌ Cadena desconocida: `{chain_name}`", parse_mode="Markdown")
+        return
+
+    prompt = " ".join(args[1:]) if len(args) > 1 else ""
+    if not prompt:
+        await update.message.reply_text("❌ Debes especificar una tarea para la cadena.")
+        return
+
+    session = _get_session(update.effective_user.id)
+    _record_command(session, f"/chain {chain_name} {prompt}")
+
+    step_names = " → ".join(s.agent for s in chain_steps)
+    await update.message.reply_text(
+        f"🔗 Ejecutando cadena: *{step_names}*\n⏳ Esto puede tardar...",
+        parse_mode="Markdown",
+    )
+
+    result = await chaining.execute_chain(prompt, chain_steps)
+
+    if result.success:
+        response = f"✅ *Cadena completada* ({result.steps_completed}/{result.steps_total} pasos)\n\n{result.output}"
+    else:
+        response = (
+            f"⚠️ *Cadena parcial* ({result.steps_completed}/{result.steps_total} pasos)\n"
+            f"❌ Falló en: `{result.failed_step}`\n"
+            f"Error: {result.error}\n\n"
+        )
+        if result.output:
+            response += f"Resultado parcial:\n{result.output}"
+
+    if len(response) > 4000:
+        for chunk_start in range(0, len(response), 3900):
+            chunk = response[chunk_start : chunk_start + 3900]
+            await update.message.reply_text(chunk, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(response, parse_mode="Markdown")
+
+    _record_bot_reply(session, response[:800])
+
+
 async def opencode_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /opencode and /oc commands to send tasks to OpenCode.
 
@@ -702,6 +858,7 @@ async def opencode_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             "• `connector` — Descubrir conexiones entre notas\n"
             "• `writer` — Generar ensayos y síntesis\n"
             "• `archivist` — Gestión de inbox y archivo\n"
+            "• `examiner` — Retención y repaso activo\n"
             "• `developer` — Desarrollo de código\n\n"
             "Ejemplos:\n"
             "`/oc reviewer audit`\n"
@@ -714,7 +871,7 @@ async def opencode_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
     # --- Parse agent and prompt ---
     agent = None
-    known_agents = ("librarian", "developer", "reviewer", "connector", "writer", "archivist", "plan", "build", "explore", "general", "vision")
+    known_agents = ("librarian", "developer", "reviewer", "connector", "writer", "archivist", "examiner", "plan", "build", "explore", "general", "vision")
     if args and args[0] in known_agents:
         agent = args.pop(0)
 
@@ -777,6 +934,408 @@ async def opencode_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+# ============================================
+# EXAM / QUIZ HANDLERS
+# ============================================
+
+
+def _find_item_by_title(
+    query: str, items: list[dict],
+) -> tuple[dict | None, list[str]]:
+    """Case-insensitive fuzzy search for a reviewable item by title.
+
+    Returns (matched_item, suggestions).  If matched_item is not None,
+    suggestions is empty.
+    """
+    from difflib import SequenceMatcher
+
+    query_lower = query.lower().strip()
+
+    # 1. Exact substring match (case-insensitive)
+    for item in items:
+        if query_lower == item["title"].lower():
+            return item, []
+    for item in items:
+        if query_lower in item["title"].lower() or item["title"].lower() in query_lower:
+            return item, []
+
+    # 2. Fuzzy match (>0.6 ratio)
+    best_ratio = 0.0
+    best_item = None
+    for item in items:
+        ratio = SequenceMatcher(None, query_lower, item["title"].lower()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_item = item
+    if best_ratio > 0.6 and best_item:
+        return best_item, []
+
+    # 3. Word-level partial match for suggestions
+    query_words = query_lower.split()
+    titles = [i["title"] for i in items]
+    suggestions = [t for t in titles if any(w in t.lower() for w in query_words)]
+    return None, suggestions[:5]
+
+
+async def quiz_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /quiz command — quick quiz from vault content."""
+    if not await _check_auth(update):
+        return
+
+    user_id = update.effective_user.id
+    session = _get_session(user_id)
+    args = list(ctx.args) if ctx.args else []
+    _record_command(session, f"/quiz {' '.join(args)}".strip())
+
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    # Check for --connect flag
+    connect_mode = "--connect" in args or "-c" in args
+    args = [a for a in args if a not in ("--connect", "-c")]
+
+    # Get reviewable items
+    items = exam.get_reviewable_items()
+    if len(items) < exam.MIN_ITEMS_FOR_QUIZ:
+        await update.message.reply_text(
+            "🧪 *Quiz*\n\n"
+            "Aún no tienes suficiente contenido para un quiz.\n"
+            "Sigue capturando notas y vuelve cuando tengas más. 📚",
+            parse_mode="Markdown",
+        )
+        return
+
+    if connect_mode:
+        questions = exam.generate_connection_questions(items)
+        source_label = "Conexiones entre notas"
+    elif args:
+        title_query = " ".join(args)
+        matched, suggestions = _find_item_by_title(title_query, items)
+        if not matched:
+            if suggestions:
+                suggest_text = "\n".join(f"• {s}" for s in suggestions)
+                await update.message.reply_text(
+                    f"🧪 No encontré '{title_query}'.\n¿Quisiste decir?\n{suggest_text}",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"🧪 No encontré '{title_query}' en tu vault.",
+                )
+            return
+
+        questions = exam.generate_questions(
+            matched["content"], matched["title"], matched["type"],
+        )
+        source_label = matched["title"]
+    else:
+        # Random quiz — prefer due items
+        due = exam.get_due_items()
+        target = due[0] if due else random.choice(items)
+        questions = exam.generate_questions(
+            target["content"], target["title"], target["type"],
+        )
+        source_label = target["title"]
+
+    if not questions:
+        await update.message.reply_text("❌ No pude generar preguntas. Intenta de nuevo.")
+        return
+
+    # Start quiz session
+    quiz = exam.QuizSession(questions=questions, active=True)
+    _quiz_sessions[user_id] = quiz
+
+    q = quiz.current_question
+    type_icons = {
+        "recall": "🔄", "application": "🎯", "synthesis": "🧩",
+        "connection": "🔗", "contrast": "⚖️", "truefalse": "✅❌",
+    }
+    icon = type_icons.get(q.question_type, "❓")
+
+    await update.message.reply_text(
+        f"🧪 *Quiz — {source_label}*\n"
+        f"Pregunta 1/{quiz.total}\n\n"
+        f"{icon} {q.question}\n\n"
+        f"_Responde con texto o escribe /skip para saltar._",
+        parse_mode="Markdown",
+    )
+
+
+async def exam_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /exam command — deep exam on a specific Encounter."""
+    if not await _check_auth(update):
+        return
+
+    user_id = update.effective_user.id
+    session = _get_session(user_id)
+    args = list(ctx.args) if ctx.args else []
+    _record_command(session, f"/exam {' '.join(args)}".strip())
+
+    if not args:
+        await update.message.reply_text(
+            "🧪 *Examen profundo*\n\n"
+            "Uso: `/exam <título>` — Examen de 8 preguntas sobre un libro o nota\n\n"
+            "Ejemplo: `/exam The Systemic CTO`",
+            parse_mode="Markdown",
+        )
+        return
+
+    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    title_query = " ".join(args)
+    items = exam.get_reviewable_items()
+
+    matched, suggestions = _find_item_by_title(title_query, items)
+    if not matched:
+        if suggestions:
+            suggest_text = "\n".join(f"• {s}" for s in suggestions)
+            await update.message.reply_text(
+                f"🧪 No encontré '{title_query}'.\n¿Quisiste decir?\n{suggest_text}",
+            )
+        else:
+            await update.message.reply_text(f"🧪 No encontré '{title_query}' en tu vault.")
+        return
+
+    questions = exam.generate_questions(
+        matched["content"], matched["title"], matched["type"],
+        count=exam.DEEP_EXAM_COUNT,
+    )
+
+    if not questions:
+        await update.message.reply_text("❌ No pude generar preguntas. Intenta de nuevo.")
+        return
+
+    quiz = exam.QuizSession(questions=questions, active=True)
+    _quiz_sessions[user_id] = quiz
+
+    q = quiz.current_question
+    type_icons = {
+        "recall": "🔄", "application": "🎯", "synthesis": "🧩",
+        "connection": "🔗", "contrast": "⚖️", "truefalse": "✅❌",
+    }
+    icon = type_icons.get(q.question_type, "❓")
+
+    await update.message.reply_text(
+        f"🧪 *Examen — {matched['title']}*\n"
+        f"Pregunta 1/{quiz.total}\n\n"
+        f"{icon} {q.question}\n\n"
+        f"_Responde con texto o escribe /skip para saltar._",
+        parse_mode="Markdown",
+    )
+
+
+async def score_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /score command — retention dashboard."""
+    if not await _check_auth(update):
+        return
+
+    session = _get_session(update.effective_user.id)
+    _record_command(session, "/score")
+
+    stats = exam.get_stats()
+
+    parts = [
+        "📊 *Retention Dashboard*\n",
+        "━" * 24,
+        f"\n📚 Items rastreados: {stats['total_tracked']}",
+        f"📝 Total revisable: {stats['total_reviewable']}",
+        f"🆕 Sin revisar: {stats['never_reviewed']}",
+        f"✅ Revisados hoy: {stats['reviewed_today']}",
+        f"🔄 Pendientes de revisión: {stats['due_count']}",
+        f"📈 Retención promedio: {stats['avg_retention']}%",
+    ]
+
+    if stats["strengths"]:
+        parts.append("\n🏆 *Puntos fuertes* (ease alto)")
+        for s in stats["strengths"]:
+            parts.append(f"  • {s['title']} — ease: {s['ease']}")
+
+    if stats["needs_work"]:
+        parts.append("\n⚠️ *Necesita repaso* (ease bajo)")
+        for s in stats["needs_work"]:
+            parts.append(f"  • {s['title']} — ease: {s['ease']}")
+
+    parts.append(f"\n📅 Mañana: {stats['upcoming_tomorrow']} revisiones")
+    parts.append(f"📅 Esta semana: {stats['upcoming_week']} revisiones")
+
+    await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+
+
+async def review_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /review command — show items due for review."""
+    if not await _check_auth(update):
+        return
+
+    session = _get_session(update.effective_user.id)
+    _record_command(session, "/review")
+
+    due = exam.get_due_items()
+
+    if not due:
+        await update.message.reply_text(
+            "🧪 *Revisión*\n\n"
+            "✅ ¡No tienes items pendientes de revisión!\n"
+            "Usa `/quiz` para un quiz voluntario.",
+            parse_mode="Markdown",
+        )
+        return
+
+    parts = [f"🧪 *Items pendientes de revisión: {len(due)}*\n"]
+
+    for i, item in enumerate(due[:10], 1):
+        icon = "🗂️" if item["type"] == "card" else "📚"
+        new_badge = " 🆕" if item.get("never_reviewed") else ""
+        parts.append(f"{i}. {icon} {item['title']}{new_badge}")
+
+    if len(due) > 10:
+        parts.append(f"\n...y {len(due) - 10} más")
+
+    parts.append("\n💡 Usa `/quiz` para empezar un quiz con el contenido pendiente.")
+
+    await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+
+
+async def skip_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /skip command — skip current quiz question."""
+    if not await _check_auth(update):
+        return
+
+    user_id = update.effective_user.id
+    quiz = _quiz_sessions.get(user_id)
+
+    if not quiz or not quiz.active:
+        await update.message.reply_text("No hay quiz activo. Usa /quiz para empezar uno.")
+        return
+
+    q = quiz.current_question
+    if q:
+        await update.message.reply_text(
+            f"⏭️ Saltada.\n📖 Respuesta: _{q.expected_answer}_",
+            parse_mode="Markdown",
+        )
+        quiz.scores.append(-1)  # -1 = skipped, don't update tracker
+        quiz.answers.append("[skipped]")
+    quiz.current_index += 1
+
+    await _send_next_question_or_finish(update, user_id, quiz)
+
+
+async def _handle_quiz_answer(update: Update, user_id: int) -> bool:
+    """Try to handle the message as a quiz answer.
+
+    Returns True if a quiz was active and the answer was processed.
+    """
+    quiz = _quiz_sessions.get(user_id)
+    if not quiz or not quiz.active or quiz.is_complete:
+        return False
+
+    q = quiz.current_question
+    if not q:
+        return False
+
+    user_answer = update.message.text.strip()
+
+    await ctx_bot_action(update, ChatAction.TYPING)
+
+    result = exam.evaluate_answer(q, user_answer)
+    score = result["score"]
+
+    quiz.scores.append(score)
+    quiz.answers.append(user_answer)
+
+    # Build feedback
+    parts = [f"{result['emoji']} Score: {score}/5"]
+    if result["feedback"]:
+        parts.append(result["feedback"])
+    if result.get("correct_answer") and score < 4:
+        parts.append(f"📖 Respuesta: _{result['correct_answer']}_")
+    if result.get("tip") and score < 3:
+        parts.append(f"💡 Tip: {result['tip']}")
+
+    await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+
+    # Record review in tracker
+    if score >= 0:
+        exam.record_review(q.source_type, q.source_title, score)
+
+    quiz.current_index += 1
+    await _send_next_question_or_finish(update, user_id, quiz)
+    return True
+
+
+async def ctx_bot_action(update: Update, action: str) -> None:
+    """Send chat action via the update's bot."""
+    try:
+        await update.get_bot().send_chat_action(
+            chat_id=update.effective_chat.id, action=action,
+        )
+    except Exception:
+        pass
+
+
+async def _send_next_question_or_finish(
+    update: Update, user_id: int, quiz: exam.QuizSession,
+) -> None:
+    """Send the next question or show the quiz summary."""
+    if quiz.is_complete:
+        quiz.active = False
+        # Build summary
+        valid_scores = [s for s in quiz.scores if s >= 0]
+        if valid_scores:
+            total = sum(valid_scores)
+            max_total = len(valid_scores) * 5
+            pct = round(total / max_total * 100) if max_total else 0
+
+            table = ["", "| # | Tipo | Score | Estado |", "|---|------|-------|--------|"]
+            type_icons = {
+                "recall": "🔄", "application": "🎯", "synthesis": "🧩",
+                "connection": "🔗", "contrast": "⚖️", "truefalse": "✅❌",
+            }
+            for i, q in enumerate(quiz.questions):
+                s = quiz.scores[i] if i < len(quiz.scores) else -1
+                icon = type_icons.get(q.question_type, "❓")
+                if s < 0:
+                    status = "⏭️"
+                    score_str = "—"
+                elif s >= 4:
+                    status = "✅"
+                    score_str = f"{s}/5"
+                elif s >= 3:
+                    status = "🟡"
+                    score_str = f"{s}/5"
+                else:
+                    status = "❌"
+                    score_str = f"{s}/5"
+                table.append(f"| {i+1} | {icon} | {score_str} | {status} |")
+
+            result_text = (
+                f"📊 *Resultado del quiz*\n"
+                f"📖 Fuente: {quiz.questions[0].source_title}\n"
+                + "\n".join(table)
+                + f"\n\n*Total: {total}/{max_total} ({pct}%)*"
+            )
+        else:
+            result_text = "📊 *Quiz completado* — todas las preguntas fueron saltadas."
+
+        await update.message.reply_text(result_text, parse_mode="Markdown")
+        _quiz_sessions.pop(user_id, None)
+        return
+
+    # Next question
+    q = quiz.current_question
+    type_icons = {
+        "recall": "🔄", "application": "🎯", "synthesis": "🧩",
+        "connection": "🔗", "contrast": "⚖️", "truefalse": "✅❌",
+    }
+    icon = type_icons.get(q.question_type, "❓")
+
+    await update.message.reply_text(
+        f"Pregunta {quiz.current_index + 1}/{quiz.total}\n\n"
+        f"{icon} {q.question}\n\n"
+        f"_Responde con texto o escribe /skip para saltar._",
+        parse_mode="Markdown",
+    )
+
+
 # --- Message Handlers ---
 
 
@@ -802,7 +1361,13 @@ async def photo_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _check_auth(update):
         return
-    session = _get_session(update.effective_user.id)
+
+    # If the user has an active quiz, treat the message as a quiz answer
+    user_id = update.effective_user.id
+    if await _handle_quiz_answer(update, user_id):
+        return
+
+    session = _get_session(user_id)
 
     await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 

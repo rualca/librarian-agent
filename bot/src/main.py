@@ -28,7 +28,16 @@ from src.handlers import (
     reading_handler,
     orphan_handler,
     find_handler,
+    reindex_handler,
+    jobs_handler,
+    chain_handler,
+    quiz_handler,
+    exam_handler,
+    score_handler,
+    review_handler,
+    skip_handler,
 )
+from src.scheduler import register_scheduled_jobs
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -57,6 +66,16 @@ def main() -> None:
     app.add_handler(CommandHandler("reading", reading_handler))
     app.add_handler(CommandHandler("orphan", orphan_handler))
     app.add_handler(CommandHandler("find", find_handler))
+    app.add_handler(CommandHandler("reindex", reindex_handler))
+    app.add_handler(CommandHandler("jobs", jobs_handler))
+    app.add_handler(CommandHandler("chain", chain_handler))
+
+    # Exam / Quiz commands
+    app.add_handler(CommandHandler("quiz", quiz_handler))
+    app.add_handler(CommandHandler("exam", exam_handler))
+    app.add_handler(CommandHandler("score", score_handler))
+    app.add_handler(CommandHandler("review", review_handler))
+    app.add_handler(CommandHandler("skip", skip_handler))
 
     # Callback queries (inline keyboard buttons)
     app.add_handler(CallbackQueryHandler(callback_handler))
@@ -73,6 +92,9 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
     )
+
+    # Scheduled agent jobs
+    register_scheduled_jobs(app)
 
     logger.info("🧠 Librarian bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
